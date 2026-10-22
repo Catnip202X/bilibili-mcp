@@ -18,8 +18,9 @@ from mcp.server.fastmcp import FastMCP
 from bilibili_api import video, search, comment, Credential, dynamic, opus
 from bilibili_api import hot, rank, user, session, favorite_list
 from bilibili_api.video_uploader import (
-    VideoUploader, VideoUploaderPage, VideoMeta, Lines,
+    VideoUploader, VideoUploaderPage, VideoMeta, Lines, upload_cover,
 )
+from datetime import datetime
 from bilibili_api.utils.picture import Picture
 from bilibili_api.login_v2 import QrCodeLogin, QrCodeLoginEvents
 
@@ -684,6 +685,19 @@ async def bili_send_dynamic(
 
 # ========== Tool 9: 上传视频 ==========
 
+class _MetaWithExtra(VideoMeta):
+    """在 VideoMeta 生成的投稿参数上追加库里没有的字段（cover43、creation_statement）"""
+
+    def __init__(self, extra: dict, **kwargs):
+        super().__init__(**kwargs)
+        self.extra = extra
+
+    def __dict__(self) -> dict:
+        d = super().__dict__()
+        d.update(self.extra)
+        return d
+
+
 @mcp.tool()
 async def bili_upload_video(
     video_path: str,
@@ -695,6 +709,9 @@ async def bili_upload_video(
     source: str = "",
     dynamic_text: str = "",
     no_reprint: bool = True,
+    cover43_path: str = "",
+    publish_time: str = "",
+    ai_content: bool = False,
 ) -> str:
     """
     上传视频到B站
@@ -713,11 +730,24 @@ async def bili_upload_video(
         source: 转载来源URL（非原创时必填）
         dynamic_text: 粉丝动态文本（可选，投稿时同步发布的动态内容）
         no_reprint: 是否启用未经作者授权禁止转载，默认True
+        cover43_path: 4:3 封面图片路径（可选，用于首页等 4:3 位置）
+        publish_time: 定时发布时间，本机时区 "YYYY-MM-DD HH:MM"（可选，需距现在 2 小时~15 天；不填则立即发布）
+        ai_content: 创作声明"含AI生成内容"，默认False
 
     Returns:
         上传结果，包含BV号
     """
     # ---- 参数校验 ----
+    # 定时发布最先校验：时间写错时宁可不传，也不能变成立即发布
+    delay_time = None
+    if publish_time and publish_time.strip():
+        try:
+            delay_time = int(datetime.strptime(publish_time.strip(), "%Y-%m-%d %H:%M").timestamp())
+        except ValueError:
+            return json.dumps({"success": False, "error": "publish_time 格式应为 \"YYYY-MM-DD HH:MM\""}, ensure_ascii=False)
+        if not time.time() + 7200 <= delay_time <= time.time() + 15 * 86400:
+            return json.dumps({"success": False, "error": "publish_time 需距现在 2 小时~15 天"}, ensure_ascii=False)
+
     if not video_path or not video_path.strip():
         return json.dumps({"success": False, "error": "video_path 不能为空，请提供视频文件的本地路径"}, ensure_ascii=False)
 
@@ -727,6 +757,10 @@ async def bili_upload_video(
 
     if not title or not title.strip():
         return json.dumps({"success": False, "error": "title 不能为空"}, ensure_ascii=False)
+
+    cover43_path = (cover43_path or "").strip()
+    if cover43_path and not os.path.isfile(cover43_path):
+        return json.dumps({"success": False, "error": f"4:3 封面文件不存在: {cover43_path}"}, ensure_ascii=False)
 
     cred = get_cred()
 
@@ -752,7 +786,15 @@ async def bili_upload_video(
         else:
             cover_pic = _extract_cover_from_video(video_path)
 
-        meta = VideoMeta(
+        # VideoMeta 不支持的投稿字段：4:3 封面 URL、创作声明（id 1 = 含AI生成内容）
+        extra = {}
+        if cover43_path:
+            extra["cover43"] = await upload_cover(Picture.from_file(cover43_path), cred)
+        if ai_content:
+            extra["creation_statement"] = {"id": 1}
+
+        meta = _MetaWithExtra(
+            extra,
             tid=tid,
             title=title.strip()[:80],
             desc=desc or "",
@@ -762,6 +804,7 @@ async def bili_upload_video(
             source=source.strip() if source and source.strip() else None,
             no_reprint=no_reprint if is_original else False,
             dynamic=dynamic_text.strip() if dynamic_text and dynamic_text.strip() else None,
+            delay_time=delay_time,
         )
 
         uploader = VideoUploader(
