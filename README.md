@@ -184,3 +184,41 @@ bilibili-mcp/
 ## License
 
 MIT
+---
+
+## 无人值守上传（可选）
+
+凭证口令默认通过 macOS 对话框输入。想把上传放进定时任务（CI、每日自动投稿）时，可以把口令
+存进**登录钥匙串**，MCP 进程解锁凭证时优先读钥匙串，不再弹窗：
+
+```bash
+python vault_cli.py store    # 弹一次对话框，验证能解密后存进钥匙串
+python vault_cli.py check    # 查看状态
+python vault_cli.py clear    # 删掉，回到手动输口令
+```
+
+- 口令只落在钥匙串（`security` 的 generic password，service 可用 `BILI_MCP_KEYCHAIN_SERVICE` 改名），
+  不写文件、不进环境变量、不进日志；凭证本体仍是 AES-256-GCM 密文，AI 助手依然读不到。
+- 非 macOS 上自动跳过钥匙串，行为与之前完全一致。
+
+### 慢链路 / 海外线路的上传
+
+海外网络到 B 站 `upos` CDN 的单连接上行可能只有几十 KB/s，一块 10 MB 数据在默认 30 秒超时内写不完，
+于是每块判失败并无限重传——调用方看到的只是"一直卡着"。上传路径现在是：
+
+| 行为 | 默认 | 覆盖 |
+|---|---|---|
+| 上传期间 HTTP 超时 | 1800 秒 | `BILI_MCP_UPLOAD_TIMEOUT` |
+| 分块并发（服务端默认 4） | 12 | `BILI_MCP_UPLOAD_THREADS` |
+| 停滞看门狗（无进度即取消并回报最后阶段） | 900 秒 | `BILI_MCP_UPLOAD_STALL` |
+
+进度事件写到 stderr（如 `CHUNK_FAILED {"offset": 10485760, ...}`），失败时返回值里带 `last_phase`，
+不会再出现"调用挂住、不知道停在哪一步"。
+
+### 核对投稿是否已提交
+
+```text
+bili_upload_manager_info(ps=10, status="is_pubing")
+```
+
+列出内容管理里的稿件（含定时发布、审核中、未过审）——公开视频接口看不到这些，定时投稿后用它确认。

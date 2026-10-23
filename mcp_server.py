@@ -8,10 +8,12 @@ B站数据采集 MCP 服务，支持 OpenClaw / Claude Code / Cursor / Cline
 """
 
 import asyncio
+import contextlib
 import functools
 import json
 import base64
 import os
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -100,6 +102,73 @@ async def get_cred() -> Credential:
     if result.status != CredentialStatus.VALID or result.credential is None:
         raise Exception("未登录B站！请先调用 bili_login 工具获取登录二维码，让用户扫码登录。")
     return result.credential
+
+
+# ========== 上传鲁棒性：慢链路 / 海外线路 ==========
+# 海外网络到 upos CDN 的单连接上行常常只有几十 KB/s，一块 10 MB 数据在规定时间内写不完，
+# bilibili_api 就对每块判失败并无限重传，调用方看到的是"一直卡着"。这里三件事：
+#   1) 把上传期间的 HTTP 超时放大（默认 30s → 1800s，可用 BILI_MCP_UPLOAD_TIMEOUT 覆盖）
+#   2) 提高分块并发（服务端默认 4 → 12，可用 BILI_MCP_UPLOAD_THREADS 覆盖）
+#   3) 加停滞看门狗：长时间没有任何进度事件就取消并把最后阶段回报给调用方
+UPLOAD_REQUEST_TIMEOUT = float(os.environ.get("BILI_MCP_UPLOAD_TIMEOUT", "1800"))
+UPLOAD_CHUNK_THREADS = int(os.environ.get("BILI_MCP_UPLOAD_THREADS", "12"))
+UPLOAD_STALL_SEC = float(os.environ.get("BILI_MCP_UPLOAD_STALL", "900"))
+
+
+def _event_label(event) -> str:
+    """把上传事件压成一行人话：只留事件名和 offset/size/info 这类有用字段。"""
+    if not isinstance(event, dict):
+        return str(event)[:160]
+    name, data = event.get("name"), event.get("data")
+    info = ""
+    if isinstance(data, tuple) and data and isinstance(data[0], dict):
+        detail = {k: v for k, v in data[0].items() if k != "page" and not hasattr(v, "path")}
+        info = json.dumps(detail, ensure_ascii=False, default=str)[:200]
+    return f"{name} {info}".strip()
+
+
+@contextlib.contextmanager
+def _upload_tuning():
+    """上传期间放大超时、提高分块并发；退出时恢复原状（同一进程里的其它请求不受影响）。"""
+    from bilibili_api import request_settings
+    from bilibili_api.video_uploader import VideoUploader
+
+    old_timeout = request_settings.get_timeout()
+    orig_preupload = VideoUploader._preupload
+
+    async def preupload(self, page):
+        pre = await orig_preupload(self, page)
+        try:
+            pre["threads"] = max(int(pre.get("threads") or 1), UPLOAD_CHUNK_THREADS)
+        except (TypeError, ValueError):
+            pass
+        return pre
+
+    request_settings.set_timeout(UPLOAD_REQUEST_TIMEOUT)
+    VideoUploader._preupload = preupload
+    try:
+        yield
+    finally:
+        request_settings.set_timeout(old_timeout)
+        VideoUploader._preupload = orig_preupload
+
+
+async def _start_with_watchdog(uploader, progress: dict) -> dict:
+    """跑完上传；UPLOAD_STALL_SEC 秒内没有任何进度就取消，给出可读错误而不是挂死。"""
+    task = asyncio.ensure_future(uploader.start())
+    started = time.monotonic()
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=15)
+        if done:
+            return task.result()
+        idle = time.monotonic() - progress.get("last", started)
+        stalled = UPLOAD_STALL_SEC and idle > UPLOAD_STALL_SEC
+        if stalled:
+            task.cancel()
+            raise TimeoutError(
+                f"上传停滞 {idle:.0f} 秒（最后阶段：{progress.get('phase', 'init')}）；"
+                f"海外线路可调大 BILI_MCP_UPLOAD_STALL 或换网络重试"
+            )
 
 
 # ========== Tool: 扫码登录（生成二维码） ==========
@@ -896,14 +965,17 @@ async def bili_upload_video(
             credential=cred,
         )
 
-        # 上传事件回调（记录进度）
-        progress_info = {"phase": "初始化"}
+        # 上传事件回调：进度进 stderr（不占调用方上下文），失败时回报最后阶段
+        progress_info = {"phase": "init", "last": time.monotonic()}
 
         @uploader.on("__ALL__")
         async def on_event(data: dict):
-            progress_info["phase"] = str(data)
+            progress_info["phase"] = _event_label(data)
+            progress_info["last"] = time.monotonic()
+            print(f"[bili_upload] {progress_info['phase']}", file=sys.stderr, flush=True)
 
-        result = await uploader.start()
+        with _upload_tuning():
+            result = await _start_with_watchdog(uploader, progress_info)
         return json.dumps({
             "success": True,
             "message": "视频上传成功",
@@ -915,6 +987,43 @@ async def bili_upload_video(
             "error": str(e),
             "last_phase": progress_info.get("phase", "unknown") if "progress_info" in dir() else "init",
         }, ensure_ascii=False)
+
+
+# ========== Tool: 查内容管理里的稿件（含定时发布、审核中） ==========
+
+@mcp.tool()
+async def bili_upload_manager_info(ps: int = 10, status: str = "all") -> str:
+    """
+    列出内容管理（稿件管理）里的稿件，含定时发布、审核中、未过审——公开视频接口看不到这些。
+
+    Args:
+        ps: 返回条数，默认 10
+        status: all=全部 / pubed=已发布 / not_pubed=未发布 / is_pubing=审核中
+
+    Returns:
+        JSON 列表：bvid、标题、状态、发布时间（本地时间）。定时投稿后用它核对是否已提交。
+    """
+    from bilibili_api import creative_center
+    from bilibili_api.creative_center import UploadManagerStatus
+
+    mapping = {"all": UploadManagerStatus.ALL, "pubed": UploadManagerStatus.PUBED,
+               "not_pubed": UploadManagerStatus.NOT_PUBED, "is_pubing": UploadManagerStatus.IS_PUBING}
+    if status not in mapping:
+        return json.dumps({"success": False, "error": f"status 只能是 {list(mapping)}"}, ensure_ascii=False)
+    cred = await get_cred()
+    data = await creative_center.get_video_upload_manager_info(cred, ps=max(1, min(int(ps or 10), 50)),
+                                                               status=mapping[status])
+    rows = []
+    for item in (data.get("arc_audits") or data.get("archives") or []):
+        arc = item.get("Archive") or item
+        ptime = arc.get("ptime")
+        rows.append({
+            "bvid": arc.get("bvid"),
+            "title": arc.get("title"),
+            "state": (item.get("Audit") or {}).get("state_desc") or (item.get("Audit") or {}).get("state"),
+            "ptime": time.strftime("%Y-%m-%d %H:%M", time.localtime(ptime)) if isinstance(ptime, (int, float)) and ptime else None,
+        })
+    return json.dumps({"success": True, "count": len(rows), "videos": rows}, ensure_ascii=False)
 
 
 # ========== Tool 10: 上传多P视频 ==========

@@ -3,6 +3,7 @@ import os
 import stat
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import secure_store
@@ -89,6 +90,70 @@ class VaultTests(unittest.TestCase):
         Vault(self.path, ask=asker("correct horse", "correct horse")).save(SECRET)
         with self.assertRaises(VaultError):
             Vault(self.path, ask=cancel).load()
+
+
+class KeychainTests(unittest.TestCase):
+    """口令可以放 macOS 登录钥匙串，定时任务才能无人值守解锁凭证。"""
+
+    def setUp(self):
+        self._platform = secure_store.sys.platform
+
+    def tearDown(self):
+        secure_store.sys.platform = self._platform
+
+    def _run(self, returncode=0, stdout="", seen=None):
+        def fake(cmd, **kwargs):
+            if seen is not None:
+                seen.append(cmd)
+            return type("P", (), {"returncode": returncode, "stdout": stdout, "stderr": ""})()
+        return fake
+
+    def test_get_reads_login_keychain_and_strips_newline(self):
+        seen = []
+        with patch.object(secure_store.subprocess, "run", self._run(0, "hunter2\n", seen)):
+            self.assertEqual(secure_store.keychain_get(), "hunter2")
+        self.assertIn("find-generic-password", seen[0])
+        self.assertIn(secure_store.KEYCHAIN_SERVICE, seen[0])
+
+    def test_get_returns_none_when_absent(self):
+        with patch.object(secure_store.subprocess, "run", self._run(44, "")):
+            self.assertIsNone(secure_store.keychain_get())
+
+    def test_set_uses_update_flag_so_reruns_overwrite(self):
+        seen = []
+        with patch.object(secure_store.subprocess, "run", self._run(0, "", seen)):
+            self.assertTrue(secure_store.keychain_set("hunter2"))
+        self.assertIn("add-generic-password", seen[0])
+        self.assertIn("-U", seen[0])
+
+    def test_set_rejects_empty(self):
+        with patch.object(secure_store.subprocess, "run", self._run(0, "")):
+            self.assertFalse(secure_store.keychain_set(""))
+
+    def test_clear(self):
+        with patch.object(secure_store.subprocess, "run", self._run(0, "")):
+            self.assertTrue(secure_store.keychain_clear())
+
+    def test_non_darwin_never_shells_out(self):
+        secure_store.sys.platform = "linux"
+        seen = []
+        with patch.object(secure_store.subprocess, "run", self._run(0, "x", seen)):
+            self.assertIsNone(secure_store.keychain_get())
+            self.assertFalse(secure_store.keychain_set("x"))
+            self.assertFalse(secure_store.keychain_clear())
+        self.assertEqual(seen, [])
+
+    def test_ask_passphrase_prefers_keychain_over_dialog(self):
+        def boom(*_a, **_k):
+            raise AssertionError("钥匙串有口令时不该再弹对话框")
+        with patch.object(secure_store, "keychain_get", lambda: "hunter2"), \
+                patch.object(secure_store.subprocess, "run", boom):
+            self.assertEqual(secure_store.ask_passphrase("请输入口令"), "hunter2")
+
+    def test_ask_passphrase_falls_back_to_dialog(self):
+        with patch.object(secure_store, "keychain_get", lambda: None), \
+                patch.object(secure_store.subprocess, "run", self._run(0, "typed\n")):
+            self.assertEqual(secure_store.ask_passphrase("请输入口令"), "typed")
 
 
 if __name__ == "__main__":

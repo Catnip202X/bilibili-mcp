@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Callable
@@ -39,8 +40,52 @@ class VaultCorrupt(VaultError):
     """文件不是本工具写出的密文（损坏、空文件或旧版明文）。可以被新的登录覆盖。"""
 
 
+KEYCHAIN_SERVICE = os.environ.get("BILI_MCP_KEYCHAIN_SERVICE", "bilibili-mcp-vault")
+
+
+def keychain_available() -> bool:
+    """只有 macOS 才有 security 命令。"""
+    return sys.platform == "darwin"
+
+
+def keychain_get() -> str | None:
+    """读登录钥匙串里的口令（定时任务无人值守上传用）；没有或不在 macOS 上返回 None。
+
+    口令只落在钥匙串里：不写文件、不进环境变量、不进日志，AI 助手依然读不到凭证内容。
+    """
+    if not keychain_available():
+        return None
+    proc = subprocess.run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.rstrip("\n") or None
+
+
+def keychain_set(passphrase: str) -> bool:
+    """把口令写进登录钥匙串（能建就建，能改就改）。由用户显式调用，不会自动保存。"""
+    if not passphrase or not keychain_available():
+        return False
+    proc = subprocess.run(["security", "add-generic-password", "-U", "-s", KEYCHAIN_SERVICE,
+                           "-a", os.environ.get("USER", "bilibili-mcp"), "-w", passphrase],
+                          capture_output=True, text=True)
+    return proc.returncode == 0
+
+
+def keychain_clear() -> bool:
+    if not keychain_available():
+        return False
+    proc = subprocess.run(["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE],
+                          capture_output=True, text=True)
+    return proc.returncode == 0
+
+
 def ask_passphrase(prompt: str) -> str:
-    """弹出 macOS 原生对话框，隐藏输入口令。取消时抛 VaultError。"""
+    """取口令：优先用登录钥匙串里存的那份（这样定时任务可以无人值守上传），
+    没有才弹 macOS 原生对话框。取消时抛 VaultError。"""
+    saved = keychain_get()
+    if saved:
+        return saved
     script = (
         f'display dialog "{prompt}" default answer "" with hidden answer '
         'with title "bilibili-mcp 凭证保险箱" with icon caution '
