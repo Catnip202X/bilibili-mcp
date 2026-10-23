@@ -1016,12 +1016,16 @@ async def bili_upload_manager_info(ps: int = 10, status: str = "all") -> str:
     rows = []
     for item in (data.get("arc_audits") or data.get("archives") or []):
         arc = item.get("Archive") or item
-        ptime = arc.get("ptime")
+        audit = item.get("Audit") or {}
+        ptime, dtime = arc.get("ptime"), arc.get("dtime")
         rows.append({
             "bvid": arc.get("bvid"),
             "title": arc.get("title"),
-            "state": (item.get("Audit") or {}).get("state_desc") or (item.get("Audit") or {}).get("state"),
+            # 稿件状态在 Archive 上（例如「通过审核，等待发布」），Audit 不一定有
+            "state": arc.get("state_desc") or audit.get("state_desc") or arc.get("state") or audit.get("state"),
+            # dtime 才是定时发布时间；为空 = B 站会按立即发布处理
             "ptime": time.strftime("%Y-%m-%d %H:%M", time.localtime(ptime)) if isinstance(ptime, (int, float)) and ptime else None,
+            "dtime": time.strftime("%Y-%m-%d %H:%M", time.localtime(dtime)) if isinstance(dtime, (int, float)) and dtime else None,
         })
     return json.dumps({"success": True, "count": len(rows), "videos": rows}, ensure_ascii=False)
 
