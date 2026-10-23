@@ -8,6 +8,7 @@ B站数据采集 MCP 服务，支持 OpenClaw / Claude Code / Cursor / Cline
 """
 
 import asyncio
+import functools
 import json
 import base64
 import os
@@ -29,6 +30,7 @@ from bilibili_api.login_v2 import (
     QrCodeLoginEvents,
 )
 
+from secure_store import redact
 from bili_auth import (
     CredentialStatus,
     credential_is_complete,
@@ -38,9 +40,31 @@ from bili_auth import (
 
 # ========== 初始化 ==========
 
-CRED_FILE = Path(__file__).parent / "bili_credential.json"
+CRED_FILE = Path(__file__).parent / "bili_credential.enc"
 
 mcp = FastMCP("bilibili-mcp")
+
+
+# 所有工具的返回值和报错都先经过 redact()：即使 B 站接口在报错里带回 cookie / token，也不会传给 AI。
+_register_tool = mcp.tool
+
+
+def _safe_tool(*args, **kwargs):
+    register = _register_tool(*args, **kwargs)
+
+    def wrap(fn):
+        @functools.wraps(fn)
+        async def guarded(*a, **kw):
+            try:
+                out = await fn(*a, **kw)
+            except Exception as e:
+                raise Exception(redact(str(e))) from None
+            return redact(out) if isinstance(out, str) else out
+        return register(guarded)
+    return wrap
+
+
+mcp.tool = _safe_tool
 
 
 # ========== 登录会话（进程级缓存） ==========
@@ -71,6 +95,8 @@ def _session_is_expired() -> bool:
 async def get_cred() -> Credential:
     """获取凭证，未登录时引导用户调用 bili_login"""
     result = await load_credential(CRED_FILE)
+    if result.status == CredentialStatus.LOCKED:
+        raise Exception("B站凭证是加密的，需要用户在弹出的对话框里输入口令；用户取消了或口令错误。请让用户重试，不要重新扫码登录。")
     if result.status != CredentialStatus.VALID or result.credential is None:
         raise Exception("未登录B站！请先调用 bili_login 工具获取登录二维码，让用户扫码登录。")
     return result.credential
@@ -94,6 +120,12 @@ async def bili_login() -> str:
         return json.dumps({
             "status": "already_logged_in",
             "message": "已登录B站，无需重复登录",
+        }, ensure_ascii=False)
+    if credential_result.status == CredentialStatus.LOCKED:
+        return json.dumps({
+            "status": "credential_locked",
+            "message": "已有加密凭证，但口令输入被取消或错误。请让用户再试一次；"
+                       "如果用户忘了口令，需要用户自己删除 bili_credential.enc 后再重新扫码登录。",
         }, ensure_ascii=False)
 
     if _login_session is not None and not _session_is_expired():

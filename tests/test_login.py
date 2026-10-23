@@ -9,6 +9,7 @@ from bilibili_api import Credential
 from bilibili_api.login_v2 import QrCodeLoginChannel, QrCodeLoginEvents
 
 import bili_auth
+import secure_store
 import mcp_server
 from bili_auth import CredentialStatus
 
@@ -65,7 +66,13 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         root = Path(self.temp_dir.name)
-        self.credential_path = root / "bili_credential.json"
+        self.credential_path = root / "bili_credential.enc"
+        # 测试用假口令，绝不弹出真实对话框
+        bili_auth._vaults.clear()
+        self.vault_patch = patch.object(
+            bili_auth, "Vault", lambda path: secure_store.Vault(path, ask=lambda _prompt: "test-passphrase-123")
+        )
+        self.vault_patch.start()
         self.qr_path = root / "qrcode_login.png"
         self.cred_patch = patch.object(mcp_server, "CRED_FILE", self.credential_path)
         self.qr_patch = patch.object(mcp_server, "QR_FILE", self.qr_path)
@@ -75,6 +82,8 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         mcp_server._login_session_created_at = None
 
     def tearDown(self):
+        self.vault_patch.stop()
+        bili_auth._vaults.clear()
         self.cred_patch.stop()
         self.qr_patch.stop()
         mcp_server._login_session = None
@@ -166,7 +175,9 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = json.loads(await mcp_server.bili_login_check())
 
-        saved = json.loads(self.credential_path.read_text(encoding="utf-8"))
+        raw = self.credential_path.read_text(encoding="utf-8")
+        self.assertNotIn("test-sessdata", raw)  # 落盘的是密文
+        saved = bili_auth.vault_for(self.credential_path).load()
         self.assertEqual(result["status"], "done")
         self.assertEqual(saved["dedeuserid"], "24680")
         self.assertTrue(saved["sessdata"])

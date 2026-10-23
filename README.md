@@ -6,6 +6,16 @@ B站（Bilibili）MCP Server —— 让 AI 助手直接操作B站。
 
 **27 个工具**，覆盖登录认证、搜索采集、内容发布、数据分析、互动运营。
 
+> **这是一个打过补丁的 fork（`patched` 分支）。** 相对上游 adoresever/bilibili-mcp：
+>
+> - **扫码登录修复**（上游 PR #5）：改用 TV 端二维码通道，凭证校验后再保存。
+> - **投稿增强**（上游 PR #6）：`bili_upload_video` 支持 `publish_time` 定时发布（本机时间 `YYYY-MM-DD HH:MM`，2 小时～15 天后）、`cover43_path` 4:3 封面、`ai_content` "含AI生成内容"声明；分区表改读 bilibili_api 自带的当前列表，并拒绝已下线的分区 ID（B 站会把未知 ID 默默放进"生活 → 日常"）。
+> - **加密凭证保险箱**（`secure_store.py`）：登录 cookie 只以密文落盘（`bili_credential.enc`，AES-256-GCM，scrypt 从口令派生密钥）。口令在 macOS 原生对话框里输入，密钥只留在 MCP 进程内存里；所有工具的返回值和报错都经过 `redact()`，即使接口把 cookie 带回来也不会交给 AI。调用工具的 AI 助手能"使用"登录态，但读不到凭证本身。
+> - 删除了上游误提交的 `bili_credential.json.bak`（它仍在上游历史里，如果你用过上游版本，建议退出登录让旧 cookie 失效）。
+> - 依赖按哈希锁定：`python3.11 -m venv .venv && .venv/bin/pip install --require-hashes -r requirements.lock`。
+>
+> 推荐再加一层：在 MCP 客户端里禁止 AI 编辑 `secure_store.py`、读写 `bili_credential.enc`（Claude Code 可用 permissions 的 deny 规则）。
+
 ## 功能
 
 ### 登录认证

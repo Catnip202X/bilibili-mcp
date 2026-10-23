@@ -11,7 +11,7 @@ from bilibili_api.login_v2 import (
 
 from bili_auth import CredentialStatus, validate_save_and_reload
 
-CRED_FILE = Path(__file__).parent / "bili_credential.json"
+CRED_FILE = Path(__file__).parent / "bili_credential.enc"
 
 async def main():
     qr = QrCodeLogin(platform=QrCodeLoginChannel.TV)

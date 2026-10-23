@@ -30,3 +30,7 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# 加密后的凭证（密文也不要提交）
+bili_credential.enc
+.bili_credential.enc.*.tmp
