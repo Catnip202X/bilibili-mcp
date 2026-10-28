@@ -760,6 +760,123 @@ def _extract_cover_from_video(video_path: str) -> Picture:
     raise RuntimeError(f"无法从视频截取封面: {video_path}")
 
 
+# ========== 辅助：合集（season） ==========
+# 投稿接口（x/vu/web/add/v3）不收合集字段，合集归属是投稿之后单独改的。
+# 而且真正能用的是「小节」（section）：新版合集下必有一个默认小节，
+# 添加视频走 section/episodes/add，要的是 section_id（不是 season_id）+ 视频的 aid/cid。
+# 「上传时加进合集」= 传完拿到 aid → 查该合集的第一个 section → 把 aid/cid 加进去。
+
+SEASON_LIST_API = "https://member.bilibili.com/x2/creative/web/seasons"
+SEASON_SECTION_API = "https://member.bilibili.com/x2/creative/web/season/section"
+SECTION_ADD_API = "https://member.bilibili.com/x2/creative/web/season/section/episodes/add"
+SECTION_DEL_API = "https://member.bilibili.com/x2/creative/web/season/section/episode/del"
+VIDEO_VIEW_API = "https://api.bilibili.com/x/web-interface/view"
+
+
+def _member_api(url: str, method: str, cred: Credential, data: dict | None = None,
+                params: dict | None = None, json_body: bool = True):
+    """member.bilibili.com 的写接口统一走这里：csrf 在 query，JSON 体里也带一份。
+
+    episode/del 这类老接口要表单体，传 json_body=False。
+    """
+    from bilibili_api.utils.network import Api
+
+    api = Api(url=url, method=method, credential=cred, no_csrf=True,
+              json_body=json_body and data is not None, verify=True)
+    api.update_params(**(params or {"csrf": cred.bili_jct}))
+    if data is not None:
+        api.update_data(**data)
+    return api
+
+
+async def _view_meta(cred: Credential | None = None, bvid: str = "", aid: int = 0) -> dict:
+    """拿稿件的 aid / title / cid。
+
+    带上凭据再请求：裸请求会被 B 站 412 风控拦掉（公开接口也一样）。
+    """
+    from bilibili_api.utils.network import Api
+
+    params = {"bvid": bvid} if bvid else {"aid": int(aid)}
+    api = Api(url=VIDEO_VIEW_API, method="GET", credential=cred) if cred else \
+        Api(url=VIDEO_VIEW_API, method="GET")
+    data = await api.update_params(**params).result
+    return data if isinstance(data, dict) else {}
+
+
+async def _season_sections(cred: Credential, season_id: int = 0) -> list[dict]:
+    """我的合集（含每个合集的 section）；给 season_id 就只返回那一个合集的。"""
+    from bilibili_api.utils.network import Api
+
+    data = await Api(url=SEASON_LIST_API, method="GET", credential=cred, verify=True).update_params(
+        pn=1, ps=100, order="ctime", sort="desc").result
+    out = []
+    for item in (data or {}).get("seasons") or []:
+        season = item.get("season") or {}
+        if season_id and int(season.get("id") or 0) != int(season_id):
+            continue
+        for s in ((item.get("sections") or {}).get("sections") or []):
+            out.append({
+                "season_id": season.get("id"),
+                "season_title": season.get("title"),
+                "section_id": s.get("id"),
+                "section_title": s.get("title"),
+            })
+    return out
+
+
+async def _season_add(cred: Credential, section_id: int, aid: int, cid: int, title: str) -> dict:
+    """把一条视频加进合集小节。已经在里面（20080）按成功处理，重复调用是幂等的。"""
+    api = _member_api(SECTION_ADD_API, "POST", cred, data={
+        "sectionId": int(section_id),
+        "episodes": [{"aid": int(aid), "cid": int(cid), "title": title, "charging_pay": 0}],
+        "csrf": cred.bili_jct,
+    })
+    try:
+        return await api.result
+    except Exception as e:                                    # noqa: BLE001
+        if "20080" in str(e):                                 # 当前稿件已存在在合集中
+            return {"already_in_season": True}
+        raise
+
+
+async def _season_episode_id(cred: Credential, section_id: int, aid: int) -> int | None:
+    """视频在合集里的 episode_id（移除时要用它，不是 aid）。"""
+    from bilibili_api.utils.network import Api
+
+    data = await Api(url=SEASON_SECTION_API, method="GET", credential=cred, verify=True).update_params(
+        id=int(section_id)).result
+    for ep in (data or {}).get("episodes") or []:
+        if int(ep.get("aid") or 0) == int(aid):
+            return int(ep.get("id") or 0) or None
+    return None
+
+
+async def _attach_season(cred: Credential, aid: int | None, season_id: int, title: str) -> dict:
+    """上传成功后挂合集。挂失败只回报，不回滚已经传好的稿件。"""
+    if not season_id:
+        return {}
+    if not aid:
+        return {"success": False, "season_id": int(season_id),
+                "error": "投稿结果里没有 aid，未能挂合集"}
+    try:
+        sections = await _season_sections(cred, int(season_id))
+        if not sections:
+            return {"success": False, "season_id": int(season_id),
+                    "error": f"合集 {season_id} 下没有小节（section），加不进去"}
+        section = sections[0]
+        info = await _view_meta(cred, aid=int(aid))
+        cid = ((info.get("pages") or [{}])[0]).get("cid")
+        if not cid:
+            return {"success": False, "season_id": int(season_id), "error": "拿不到视频 cid"}
+        await _season_add(cred, section["section_id"], int(aid),
+                          int(cid), (info.get("title") or title or "")[:80])
+        return {"success": True, "season_id": int(season_id),
+                "section_id": section["section_id"],
+                "season_title": section.get("season_title")}
+    except Exception as e:                                    # noqa: BLE001
+        return {"success": False, "season_id": int(season_id), "error": redact(str(e))}
+
+
 
 
 @mcp.tool()
@@ -860,6 +977,7 @@ async def bili_upload_video(
     cover43_path: str = "",
     publish_time: str = "",
     ai_content: bool = False,
+    season_id: int = 0,
 ) -> str:
     """
     上传视频到B站
@@ -881,6 +999,9 @@ async def bili_upload_video(
         cover43_path: 4:3 封面图片路径（可选，用于首页等 4:3 位置）
         publish_time: 定时发布时间，本机时区 "YYYY-MM-DD HH:MM"（可选，需距现在 2 小时~15 天；不填则立即发布）
         ai_content: 创作声明"含AI生成内容"，默认False
+        season_id: 投稿后直接加入的合集 ID（0 = 不进合集）。用 bili_seasons 查自己的合集；
+                   投稿接口本身不收合集字段，这里是在传完之后立刻挂 season/switch，
+                   所以返回里会有 "season" 一项说明挂没挂上
 
     Returns:
         上传结果，包含BV号
@@ -976,10 +1097,22 @@ async def bili_upload_video(
 
         with _upload_tuning():
             result = await _start_with_watchdog(uploader, progress_info)
+
+        # 合集：投稿接口不收合集字段。定时稿发布前 B 站也不让加（62003），交给 season_sync 补。
+        season_note = {}
+        if season_id:
+            submitted = result if isinstance(result, dict) else {}
+            if delay_time is None:
+                season_note = await _attach_season(cred, submitted.get("aid"), season_id, title.strip())
+            else:
+                season_note = {"success": True, "deferred": True,
+                               "note": "定时稿：B 站不让发布前加合集，发布后用 bili_season_sync 补挂"}
+
         return json.dumps({
             "success": True,
             "message": "视频上传成功",
             "data": result if isinstance(result, dict) else str(result),
+            **({"season": season_note} if season_note else {}),
         }, ensure_ascii=False)
     except Exception as e:
         return json.dumps({
@@ -1030,6 +1163,183 @@ async def bili_upload_manager_info(ps: int = 10, status: str = "all") -> str:
     return json.dumps({"success": True, "count": len(rows), "videos": rows}, ensure_ascii=False)
 
 
+# ========== Tool: 合集（season） ==========
+
+@mcp.tool()
+async def bili_seasons() -> str:
+    """
+    列出我自己的合集（新版合集 / season）和它下面的小节（section）。
+
+    投新稿把 season_id 传给 bili_upload_video 就会直接进合集；
+    给旧稿补挂用 bili_set_season。
+
+    Returns:
+        JSON 列表：season_id、合集标题、section_id、小节标题
+    """
+    cred = await get_cred()
+    rows = await _season_sections(cred)
+    return json.dumps({"success": True, "count": len(rows), "seasons": rows}, ensure_ascii=False)
+
+
+@mcp.tool()
+async def bili_set_season(bvid: str = "", aid: int = 0, season_id: int = 0) -> str:
+    """
+    给已经投稿的视频挂进 / 移出合集（补挂旧稿用；新投稿直接用 bili_upload_video 的 season_id）。
+
+    Args:
+        bvid: 视频 BV 号（与 aid 二选一）
+        aid: 视频 aid（与 bvid 二选一）
+        season_id: 目标合集 ID；0 表示从它当前所在的合集移出
+
+    Returns:
+        操作结果（含 aid、合集/小节 ID、标题）
+    """
+    cred = await get_cred()
+    bvid = (bvid or "").strip()
+    if not aid and not bvid:
+        return json.dumps({"success": False, "error": "bvid 和 aid 至少给一个"}, ensure_ascii=False)
+
+    try:
+        info = await _view_meta(cred, bvid=bvid, aid=int(aid or 0))
+    except Exception as e:                                    # noqa: BLE001
+        msg = str(e)
+        # 公开 view 接口对「审核通过、等待发布」的定时稿就报 62003 —— 这时候连标题都查不到，
+        # 也就谈不上挂合集了，等它上线再说。
+        if "62003" in msg or "等待发布" in msg:
+            return json.dumps({"success": False, "bvid": bvid or None,
+                               "error": "这条稿件还没发布（B 站：审核通过、等待发布），"
+                                        "发布之后才能加合集；pipeline 的 season_sync 会自动补挂"},
+                              ensure_ascii=False)
+        return json.dumps({"success": False, "error": redact(msg)}, ensure_ascii=False)
+    real_aid = int(info.get("aid") or aid or 0)
+    if not real_aid:
+        return json.dumps({"success": False, "error": f"查不到稿件 {bvid or aid}"}, ensure_ascii=False)
+    title = (info.get("title") or "")[:80]
+
+    if season_id:
+        sections = await _season_sections(cred, int(season_id))
+        if not sections:
+            return json.dumps({"success": False, "error": f"合集 {season_id} 下没有小节（section）"},
+                              ensure_ascii=False)
+        section = sections[0]
+        cid = ((info.get("pages") or [{}])[0]).get("cid")
+        if not cid:
+            return json.dumps({"success": False, "error": "拿不到视频 cid"}, ensure_ascii=False)
+        try:
+            await _season_add(cred, section["section_id"], real_aid, int(cid), title)
+        except Exception as e:                                # noqa: BLE001
+            msg = str(e)
+            if "62003" in msg or "等待发布" in msg:
+                return json.dumps({"success": False, "aid": real_aid, "season_id": int(season_id),
+                                   "error": "B 站不让把「审核通过、等待发布」的定时稿加进合集；"
+                                            "等它按定时真正发布之后再挂（pipeline 的 season_sync 会自动补）"},
+                                  ensure_ascii=False)
+            return json.dumps({"success": False, "error": redact(msg), "aid": real_aid,
+                               "season_id": int(season_id)}, ensure_ascii=False)
+        return json.dumps({"success": True, "aid": real_aid, "season_id": int(season_id),
+                           "section_id": section["section_id"], "title": title,
+                           "message": f'已加入合集「{section.get("season_title")}」'}, ensure_ascii=False)
+
+    # season_id=0：从当前所在的合集里摘出去（episode/del 要的是 episode_id，不是 aid）
+    for s in await _season_sections(cred):
+        try:
+            ep_id = await _season_episode_id(cred, s["section_id"], real_aid)
+        except Exception:                                     # noqa: BLE001
+            continue
+        if not ep_id:
+            continue
+        try:
+            await _member_api(SECTION_DEL_API, "POST", cred,
+                              data={"id": ep_id, "csrf": cred.bili_jct}, json_body=False).result
+        except Exception as e:                                # noqa: BLE001
+            return json.dumps({"success": False, "error": redact(str(e)), "aid": real_aid},
+                              ensure_ascii=False)
+        return json.dumps({"success": True, "aid": real_aid, "removed_from": s.get("season_title"),
+                           "title": title, "message": "已移出合集"}, ensure_ascii=False)
+    return json.dumps({"success": True, "aid": real_aid, "title": title,
+                       "message": "这条稿件本来就不在任何合集里"}, ensure_ascii=False)
+
+
+async def _sync_season(cred: Credential, season_id: int, title_prefix: str = "",
+                       limit: int = 20, dry_run: bool = False) -> dict:
+    """把「已发布、但还没进合集」的稿件补进合集。season_sync.py 和工具都走这里。"""
+    from bilibili_api import user
+    from bilibili_api.user import VideoOrder
+    from bilibili_api.utils.network import Api
+
+    sections = await _season_sections(cred, int(season_id))
+    if not sections:
+        return {"success": False, "error": f"合集 {season_id} 下没有小节（section）"}
+    section = sections[0]
+
+    data = await Api(url=SEASON_SECTION_API, method="GET", credential=cred,
+                     verify=True).update_params(id=int(section["section_id"])).result
+    current = {int(ep.get("aid") or 0) for ep in (data or {}).get("episodes") or []}
+
+    uid = int(getattr(cred, "dedeuserid", 0) or 0)
+    if not uid:
+        return {"success": False, "error": "凭据里没有 uid"}
+    listing = await user.User(uid).get_videos(ps=max(1, min(int(limit), 50)), pn=1,
+                                              order=VideoOrder.PUBDATE)
+    vlist = ((listing or {}).get("list") or {}).get("vlist") or []
+
+    added, skipped, errors, already = [], [], [], 0
+    for v in vlist:
+        aid, title = int(v.get("aid") or 0), (v.get("title") or "")
+        if not aid or (title_prefix and not title.startswith(title_prefix)):
+            continue
+        if aid in current:
+            already += 1
+            continue
+        if dry_run:
+            skipped.append({"aid": aid, "bvid": v.get("bvid"), "title": title, "note": "dry-run"})
+            continue
+        try:
+            info = await _view_meta(cred, aid=aid)
+            cid = ((info.get("pages") or [{}])[0]).get("cid")
+            if not cid:
+                errors.append({"aid": aid, "title": title, "error": "拿不到 cid"})
+                continue
+            await _season_add(cred, section["section_id"], aid, int(cid), title[:80])
+            added.append({"aid": aid, "bvid": v.get("bvid"), "title": title})
+        except Exception as e:                                # noqa: BLE001
+            msg = str(e)
+            if "62003" in msg or "等待发布" in msg:
+                skipped.append({"aid": aid, "title": title, "note": "未发布，等它上线"})
+            else:
+                errors.append({"aid": aid, "title": title, "error": msg[:200]})
+
+    return {"success": True, "season_id": int(season_id),
+            "season_title": section.get("season_title"), "section_id": section["section_id"],
+            "already": already, "added": added, "skipped": skipped, "errors": errors}
+
+
+@mcp.tool()
+async def bili_season_sync(season_id: int = 0, title_prefix: str = "", limit: int = 20,
+                           dry_run: bool = False) -> str:
+    """
+    把「已经发布、但还没进合集」的稿件补进合集。
+
+    为什么要补：B 站不让把「审核通过、等待发布」的定时稿加进合集（62003），
+    所以投稿当时挂不上，得等它按定时真正发布之后再挂。重复调用是幂等的。
+
+    Args:
+        season_id: 合集 ID（0 = 用 config 里记的那一个）
+        title_prefix: 只补标题以它开头的稿件，留空表示不限
+        limit: 检查最近多少个已发布稿件，默认 20
+        dry_run: 只列出会补哪些，不真的动手
+
+    Returns:
+        JSON：already（已在合集）、added（本次补上）、skipped（含未发布的）、errors
+    """
+    cred = await get_cred()
+    try:
+        return json.dumps(await _sync_season(cred, int(season_id or 0), title_prefix,
+                                             limit, dry_run), ensure_ascii=False)
+    except Exception as e:                                    # noqa: BLE001
+        return json.dumps({"success": False, "error": redact(str(e))}, ensure_ascii=False)
+
+
 # ========== Tool 10: 上传多P视频 ==========
 
 @mcp.tool()
@@ -1042,6 +1352,7 @@ async def bili_upload_video_multi(
     tags: str = "AI",
     cover_path: str = "",
     source: str = "",
+    season_id: int = 0,
 ) -> str:
     """
     上传多P视频到B站（多个分P合并为一个投稿）
@@ -1055,6 +1366,7 @@ async def bili_upload_video_multi(
         tags: 标签，逗号分隔
         cover_path: 封面图片路径（可选）
         source: 转载来源URL（非原创时必填）
+        season_id: 投稿后直接加入的合集 ID（0 = 不进合集）
 
     Returns:
         上传结果
@@ -1102,10 +1414,15 @@ async def bili_upload_video_multi(
         uploader = VideoUploader(pages=pages, meta=meta, credential=cred)
 
         result = await uploader.start()
+        season_note = {}
+        if season_id:
+            submitted = result if isinstance(result, dict) else {}
+            season_note = await _attach_season(cred, submitted.get("aid"), season_id, (title or "").strip())
         return json.dumps({
             "success": True,
             "message": f"多P视频上传成功（共{len(pages)}P）",
             "data": result if isinstance(result, dict) else str(result),
+            **({"season": season_note} if season_note else {}),
         }, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)
