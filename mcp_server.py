@@ -1137,17 +1137,39 @@ async def bili_upload_manager_info(ps: int = 10, status: str = "all") -> str:
         JSON 列表：bvid、标题、状态、发布时间（本地时间）。定时投稿后用它核对是否已提交。
     """
     from bilibili_api import creative_center
-    from bilibili_api.creative_center import UploadManagerStatus
+    from bilibili_api.creative_center import UploadManagerOrder, UploadManagerStatus
 
     mapping = {"all": UploadManagerStatus.ALL, "pubed": UploadManagerStatus.PUBED,
                "not_pubed": UploadManagerStatus.NOT_PUBED, "is_pubing": UploadManagerStatus.IS_PUBING}
     if status not in mapping:
         return json.dumps({"success": False, "error": f"status 只能是 {list(mapping)}"}, ensure_ascii=False)
     cred = await get_cred()
-    data = await creative_center.get_video_upload_manager_info(cred, ps=max(1, min(int(ps or 10), 50)),
-                                                               status=mapping[status])
+    limit = max(1, min(int(ps or 10), 50))
+
+    # status=all 实测会漏掉刚投的（审核中 / 定时待发布）稿件 —— 恰好是最该看到的那几条，
+    # 所以 all 改成三个状态分开查再按 bvid 去重合并。
+    if status == "all":
+        statuses = [UploadManagerStatus.IS_PUBING, UploadManagerStatus.NOT_PUBED,
+                    UploadManagerStatus.PUBED]
+    else:
+        statuses = [mapping[status]]
+
+    seen, items = set(), []
+    for st in statuses:
+        # 默认排序是「按播放量」，播放量低的稿件根本进不了前 N 条（系列里 #2~#5 就是这么丢的）。
+        # 按上传日期排才是我们要的「最近的稿件」。
+        data = await creative_center.get_video_upload_manager_info(
+            cred, ps=limit, status=st, order=UploadManagerOrder.SENDDATE)
+        for item in (data.get("arc_audits") or data.get("archives") or []):
+            arc = item.get("Archive") or item
+            key = arc.get("bvid") or id(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(item)
+
     rows = []
-    for item in (data.get("arc_audits") or data.get("archives") or []):
+    for item in items:
         arc = item.get("Archive") or item
         audit = item.get("Audit") or {}
         ptime, dtime = arc.get("ptime"), arc.get("dtime")
