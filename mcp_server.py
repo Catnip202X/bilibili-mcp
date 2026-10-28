@@ -1301,7 +1301,7 @@ async def _sync_season(cred: Credential, season_id: int, title_prefix: str = "",
     uid = int(getattr(cred, "dedeuserid", 0) or 0)
     if not uid:
         return {"success": False, "error": "凭据里没有 uid"}
-    listing = await user.User(uid).get_videos(ps=max(1, min(int(limit), 50)), pn=1,
+    listing = await user.User(uid, credential=cred).get_videos(ps=max(1, min(int(limit), 50)), pn=1,
                                               order=VideoOrder.PUBDATE)
     vlist = ((listing or {}).get("list") or {}).get("vlist") or []
 
